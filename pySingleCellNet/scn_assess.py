@@ -29,7 +29,7 @@ def sc_classAssess(stDat,washedDat, dLevel = "description1", dLevelSID="sample_n
     expVal=expDat_good.loc[stVal.index,:]
     varGenes = findVarGenes(expDat_good, washedDat["geneStats"])
     cellgrps=stTrain[dLevel]
-    testRFs=sc_makeClassifier(expTrain, genes=varGenes, groups=cellgrps, nRand=nRand, ntrees=nTrees)
+    testRFs, X, y=sc_makeClassifier(expTrain, genes=varGenes, groups=cellgrps, nRand=nRand, ntrees=nTrees)
     ct_scores=rf_classPredict(testRFs, expVal)
     assessed= [ct_scores, stVal, stTrain]
     return assessed

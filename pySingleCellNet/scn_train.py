@@ -32,8 +32,9 @@ def sc_makeClassifier(expTrain, genes, groups, nRand=70, ntrees=2000, stratify=F
     else:
         clf = RandomForestClassifier(n_estimators=ntrees,class_weight="balanced", random_state=100)
     ggroups=np.append(np.array(groups), np.repeat("rand", nRand)).flatten()
-    clf.fit(expT.loc[:,ggenes].to_numpy(), ggroups)
-    return clf
+    X = expT.loc[:,ggenes].to_numpy()
+    clf.fit(X, ggroups)
+    return clf, X, ggroups
 
 def scn_train(aTrain,dLevel,nTopGenes = 100,nTopGenePairs = 100,nRand = 100, nTrees = 1000,stratify=False,counts_per_cell_after=1e4, scaleMax=10, limitToHVG=False, normalization = True, include_all_genes = False):
     warnings.filterwarnings('ignore')
@@ -77,8 +78,8 @@ def scn_train(aTrain,dLevel,nTopGenes = 100,nTopGenePairs = 100,nRand = 100, nTr
     print("There are", len(xpairs), "top gene pairs\n")
     pdTrain= query_transform(expRaw.loc[:,cgenesA], xpairs)
     print("Finished pair transforming the data\n")
-    tspRF=sc_makeClassifier(pdTrain.loc[:, xpairs], genes=xpairs, groups=grps, nRand = nRand, ntrees = nTrees, stratify=stratify)
-    return [cgenesA, xpairs, tspRF]
+    tspRF, X, y =sc_makeClassifier(pdTrain.loc[:, xpairs], genes=xpairs, groups=grps, nRand = nRand, ntrees = nTrees, stratify=stratify)
+    return [cgenesA, xpairs, tspRF, X, y]
 
 def scn_classify(adata, cgenes, xpairs, rf_tsp, nrand = 0 ):
     classRes = scn_predict(cgenes, xpairs, rf_tsp, adata, nrand = nrand)

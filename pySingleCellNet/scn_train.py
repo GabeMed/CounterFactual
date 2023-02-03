@@ -82,12 +82,12 @@ def scn_train(aTrain,dLevel,nTopGenes = 100,nTopGenePairs = 100,nRand = 100, nTr
     return [cgenesA, xpairs, tspRF, X, y]
 
 def scn_classify(adata, cgenes, xpairs, rf_tsp, nrand = 0 ):
-    classRes = scn_predict(cgenes, xpairs, rf_tsp, adata, nrand = nrand)
+    classRes, X_test = scn_predict(cgenes, xpairs, rf_tsp, adata, nrand = nrand)
     categories = classRes.columns.values
     adNew = ad.AnnData(classRes, obs=adata.obs, var=pd.DataFrame(index=categories))
     # adNew.obs['category'] =  classRes.idxmax(axis=1)
     adNew.obs['SCN_class'] =  classRes.idxmax(axis=1)
-    return adNew
+    return adNew, X_test
 
 def add_classRes(adata: AnnData, adClassRes, copy=False) -> AnnData:
     cNames = adClassRes.var_names
@@ -110,12 +110,12 @@ def scn_predict(cgenes, xpairs, rf_tsp, aDat, nrand = 2):
 ###    expDat= pd.DataFrame(data=aDat.X, index= aDat.obs.index.values, columns= aDat.var.index.values)
     expDat= pd.DataFrame(data=aDat.X.toarray(), index= aDat.obs.index.values, columns= aDat.var.index.values)
     expValTrans=query_transform(expDat.reindex(labels=cgenes, axis='columns', fill_value=0), xpairs)
-    classRes_val=rf_classPredict(rf_tsp, expValTrans, numRand=nrand)
-    return classRes_val
+    classRes_val, X_test=rf_classPredict(rf_tsp, expValTrans, numRand=nrand)
+    return classRes_val, X_test
 
 def rf_classPredict(rfObj,expQuery,numRand=50):
     if numRand > 0 :
         randDat=randomize(expQuery, num=numRand)
         expQuery=pd.concat([expQuery, randDat])
     xpreds= pd.DataFrame(rfObj.predict_proba(expQuery), columns= rfObj.classes_, index=expQuery.index)
-    return xpreds
+    return xpreds, expQuery

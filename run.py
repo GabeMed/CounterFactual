@@ -52,7 +52,7 @@ expTrain, expVal = pySCN.splitCommonAnnData(adTrain1, ncells=200,dLevel="cell_on
 
 [cgenesA, xpairs, tspRF, X, y] = pySCN.scn_train(expTrain, nTopGenes = 100, nRand = 100, nTrees = 1000 ,nTopGenePairs = 100, dLevel = "cell_ontology_class", stratify=True, limitToHVG=True)
 
-adVal = pySCN.scn_classify(expVal, cgenesA, xpairs, tspRF, nrand = 0)
+adVal, X_test = pySCN.scn_classify(expVal, cgenesA, xpairs, tspRF, nrand = 0)
 
 ax = sc.pl.heatmap(adVal, adVal.var_names.values, groupby='SCN_class', cmap='viridis', dendrogram=False, swap_axes=True)
 

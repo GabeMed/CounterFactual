@@ -128,16 +128,39 @@ def search_nearest_CF(m, CFlabel, Flabel, alpha):
     # the ratio is controlled by a confidence factor, alpha
     # >1 when 'forcing' counterfactual to be CFlabel cell type
     # <1 when 'allowing' counterfactual to be the same as Flabel cell type
-    def CFandF_compete_rule(m):
-        return m.nn.outputs[CFlabel] >= m.nn.outputs[Flabel] + pe.log(alpha)
-    m.CFandF_compete = pe.Constraint(rule=CFandF_compete_rule)
-    # add constraints such that the probabilities of counterfactual and factual must be greater than other cell types
-    def CF_dominant_rule(m, i):
-        return m.nn.outputs[CFlabel] >= m.nn.outputs[i]
-    m.CF_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=CF_dominant_rule)
-    def F_dominant_rule(m, i):
-        return m.nn.outputs[Flabel] >= m.nn.outputs[i]
-    m.F_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=F_dominant_rule)
+    if isinstance(CFlabel, int):
+        def CFandF_compete_rule(m):
+            return m.nn.outputs[CFlabel] >= m.nn.outputs[Flabel] + pe.log(alpha)
+
+        m.CFandF_compete = pe.Constraint(rule=CFandF_compete_rule)
+        # add constraints such that the probabilities of counterfactual and factual must be greater than other cell types
+
+        def CF_dominant_rule(m, i):
+            return m.nn.outputs[CFlabel] >= m.nn.outputs[i]
+        m.CF_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=CF_dominant_rule)
+
+        def F_dominant_rule(m, i):
+            return m.nn.outputs[Flabel] >= m.nn.outputs[i]
+        m.F_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=F_dominant_rule)
+
+    elif isinstance(CFlabel, list):
+        if isinstance(alpha, list):
+            raise ValueError("alpha must be dic as multiple CF labels are entered")
+        # considering multiple CF cells is of interest
+        m.alpha = pe.Param(CFlabel, initialize=alpha)
+        def CFandF_compete_rule(m, CFlabeli):
+            return m.nn.outputs[CFlabeli] >= m.nn.outputs[Flabel] + pe.log(m.alpha[CFlabeli])
+        m.CFandF_compete = pe.Constraint(pe.Set(initialize=CFlabel), rule=CFandF_compete_rule)
+        def CF_dominant_rule(m, i, CFlabeli):
+            return m.nn.outputs[CFlabeli] >= m.nn.outputs[i]
+        m.CF_dominant = pe.Constraint(m.IDX10 - ([x for x in CFlabel] + [Flabel]), pe.Set(initialize=CFlabel), rule=CF_dominant_rule)
+        def F_dominant_rule(m, i):
+            return m.nn.outputs[Flabel] >= m.nn.outputs[i]
+        m.F_dominant = pe.Constraint(m.IDX10 - ([x for x in CFlabel] + [Flabel]), rule=F_dominant_rule)
+
+    else:
+        raise ValueError("CFlabel must be integer or list")
+
     solver.solve(m, tee=False)
     # transform the xCF into numpy array
     xCF = np.zeros(979)
@@ -157,18 +180,40 @@ def solve_CF(formulation, query_data, CFlabel, alpha):
     m = build_basic_model(formulation)
     xF, Flabel = generate_factual_param(m, query_data)
     xCF, yCF = search_nearest_CF(m, CFlabel, Flabel, alpha) # yCF is probabilities of each label
-    probability_CF = yCF[CFlabel]
-    probability_F = yCF[Flabel]
-    label_CF = np.argmax(yCF)
-    if label_CF == CFlabel:
-        print(f'the most possible cell type is {label_CF}, as the same as input CFlabel: {CFlabel}\n'
-              f'the most possible cell type is {label_CF}, with probability of : {round(probability_CF*100, 2)}% \n'
-              f'the second most possible cell type is {Flabel}, with probability of: {round(probability_F*100, 2)}%')
-    else:
-        print(f'the most possible cell type is {label_CF}, not the same as input CFlabel: {CFlabel}, \n'
-              f'but the same as input Flabel: {Flabel}\n'
-              f'the most possible cell type is {label_CF}, with probability of : {round(probability_F*100, 2)}% \n'
-              f'the second most possible cell type is {CFlabel}, with probability of : {round(probability_CF*100, 2)}%')
+    if isinstance(CFlabel, int):
+        probability_CF = yCF[CFlabel]
+        probability_F = yCF[Flabel]
+        label_CF = np.argmax(yCF)
+
+        if label_CF == CFlabel:
+            print(f'the most possible cell type is {label_CF}, as the same as input CFlabel: {CFlabel}\n'
+                  f'the most possible cell type is {label_CF}, with probability of : {round(probability_CF * 100, 2)}% \n'
+                  f'the second most possible cell type is {Flabel}, with probability of: {round(probability_F * 100, 2)}%')
+        else:
+            print(f'the most possible cell type is {label_CF}, not the same as input CFlabel: {CFlabel}, \n'
+                  f'but the same as input Flabel: {Flabel}\n'
+                  f'the most possible cell type is {label_CF}, with probability of : {round(probability_F * 100, 2)}% \n'
+                  f'the second most possible cell type is {CFlabel}, with probability of : {round(probability_CF * 100, 2)}%')
+
+    elif isinstance(CFlabel, list):
+        probability_CF = [yCF[CFlabeli] for CFlabeli in CFlabel]
+        probability_F = yCF[Flabel]
+        label_CF = np.argmax(yCF)
+
+        if label_CF in CFlabel:
+            print(f'the most possible cell type is {label_CF}, included in input CFlabel: {CFlabel}\n'
+                  f'the most possible cell type is {label_CF}, with probability of : {round(max(probability_CF) * 100, 2)}% \n'
+                  f'the other cell type in CFlabel is {[x for x in CFlabel if x != label_CF]}, '
+                  f'with probability of : {[round(x * 100, 2) for x in probability_CF if x != max(probability_CF)]}% \n'
+                  f'the factual cell type is {Flabel}, with probability of: {round(probability_F * 100, 2)}% \n'
+                  )
+        else:
+            print(f'the most possible cell type is {label_CF}, not included in input CFlabel: {CFlabel}, \n'
+                  f'but the same as input Flabel: {Flabel}\n'
+                  f'the most possible cell type is {label_CF}, with probability of : {round(probability_F * 100, 2)}% \n'
+                  f'CF cell types are {CFlabel}, with probabilities of {[round(x * 100, 2) for x in probability_CF]}%'
+                  )
+
     distance_obj = m.obj()
     dx = xCF != xF
     print(f'nearest distance is {sum(bool(d) for d in dx)}, as the same as obj value {distance_obj}')
@@ -180,7 +225,7 @@ def solve_CF(formulation, query_data, CFlabel, alpha):
     print(f'dxpair: {dxpair} \n'
           f'dxF   : {dxF} \n'
           f'dCF   : {dxCF}')
-    # remember to delete the constraint CFconsistency for the next run
+    # remember to delete the model for the next run
     del m
     return xCF, yCF, probability_CF, probability_F, distance_obj, dx, dx_position, dxpair, dxF, dxCF
 
@@ -230,10 +275,14 @@ make sure check the factual label by:
 print(query_data[-1])
 CFlabel = i # i from 0 to 10
 """
-# use the first cell in test data as an example (its label is cell type 5)
-query_data = test_data[0]
-CFlabel = 1 # choose the counterfactual cell type of interest here
+# use the 25th cell in test data as an example
+# its label is cell type 7, lymphocyte, because we can use it as an example
+# to examine the performance on "lymphocyte differentiate to B cell (type 0) or Natural killer cell (type 4)"
+query_data = test_data[24]
 
+
+# 1. You can search for trajetories towards type 0 and type 4 separately
+CFlabel = 0 # choose the counterfactual cell type of interest here
 # set confidence factor alphas
 alphas = [0.01, 0.02, 0.04, 0.08,
           0.1, 0.2, 0.3,
@@ -249,6 +298,32 @@ print(f'use the alpha key to access the attributes of interest:\n'
       f'{alpha_key}')
 print(distance_obj_dic)
 print(probability_CF_dic)
+
+CFlabel = 4 # choose the counterfactual cell type of interest here
+# set confidence factor alphas
+alphas = [0.01, 0.02, 0.04, 0.08,
+          0.1, 0.2, 0.3,
+          0.6, 0.8,
+          1.2, 1.8,
+          3, 5, 8, 10,
+          15, 20, 30, 40, 50, 60,
+          100, 200, 300, 400
+          ]
+xCF_dic, yCF_dic, probability_CF_dic, probability_F_dic, distance_obj_dic, dx_position_dic, dxpair_dic, dxF_dic, dxCF_dic = solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas)
+alpha_key = list(xCF_dic.keys())
+print(f'use the alpha key to access the attributes of interest:\n'
+      f'{alpha_key}')
+print(distance_obj_dic)
+print(probability_CF_dic)
+
+
+# 2. You can fine tune the two values in alpha to find the hybrid cell state where type 0 and type 4 are both considerable
+#    but it can't find the trajecotry with change of certain value in alpha to determine which state occurs first
+CFlabel = [0, 4] # choose the counterfactual cell type of interest here, which type 0 and type 4 in this case
+alpha = {0: 1,
+         4: 0.7} # fine tune here
+xCF, yCF, probability_CF, probability_F, distance_obj, dx, dx_position, dxpair, dxF, dxCF = solve_CF(formulation, query_data,
+                                                                                              CFlabel, alpha)
 
 
 

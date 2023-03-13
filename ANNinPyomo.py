@@ -13,9 +13,9 @@ from omlt.io.onnx import load_onnx_neural_network
 import onnx
 
 xpairs = np.load('xpairs.npy')
-test_data = np.load('test_data.npy')
+test_data = np.load('test_data_new.npy')
 test_data = torch.from_numpy(test_data).float()
-train_data = np.load('train_data.npy')
+train_data = np.load('train_data_new.npy')
 train_data = torch.from_numpy(train_data).float()
 train_kwargs = {'batch_size': 256}
 test_kwargs = {'batch_size': 256}
@@ -36,7 +36,7 @@ class NeuralNetwork(nn.Module):
 
 # load weights from trained model
 model = NeuralNetwork()
-model.load_state_dict(torch.load('ANNmodel_weights.pth'))
+model.load_state_dict(torch.load('ANNmodel_weights_new.pth'))
 
 
 input_bounds = {}
@@ -134,7 +134,7 @@ def search_nearest_CF(m, CFlabel, Flabel, alpha):
 
         m.CFandF_compete = pe.Constraint(rule=CFandF_compete_rule)
         # add constraints such that the probabilities of counterfactual and factual must be greater than other cell types
-
+        #"""
         def CF_dominant_rule(m, i):
             return m.nn.outputs[CFlabel] >= m.nn.outputs[i]
         m.CF_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=CF_dominant_rule)
@@ -142,15 +142,18 @@ def search_nearest_CF(m, CFlabel, Flabel, alpha):
         def F_dominant_rule(m, i):
             return m.nn.outputs[Flabel] >= m.nn.outputs[i]
         m.F_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=F_dominant_rule)
-
+        #"""
     elif isinstance(CFlabel, list):
         if isinstance(alpha, list):
             raise ValueError("alpha must be dic as multiple CF labels are entered")
         # considering multiple CF cells is of interest
-        m.alpha = pe.Param(CFlabel, initialize=alpha)
+        m.alpha = pe.Param(CFlabel, initialize={key: value for key, value in alpha.items() if key != 'between'})
         def CFandF_compete_rule(m, CFlabeli):
             return m.nn.outputs[CFlabeli] >= m.nn.outputs[Flabel] + pe.log(m.alpha[CFlabeli])
         m.CFandF_compete = pe.Constraint(pe.Set(initialize=CFlabel), rule=CFandF_compete_rule)
+        def CFandCF_compete_rule(m): # this constraint hasn't been developed to fit the situation where there are more than three CFlabel
+            return m.nn.outputs[CFlabel[0]] >= m.nn.outputs[CFlabel[1]] + pe.log(alpha['between'])
+        m.CFandCF_compete = pe.Constraint(rule=CFandCF_compete_rule)
         def CF_dominant_rule(m, i, CFlabeli):
             return m.nn.outputs[CFlabeli] >= m.nn.outputs[i]
         m.CF_dominant = pe.Constraint(m.IDX10 - ([x for x in CFlabel] + [Flabel]), pe.Set(initialize=CFlabel), rule=CF_dominant_rule)
@@ -275,11 +278,20 @@ make sure check the factual label by:
 print(query_data[-1])
 CFlabel = i # i from 0 to 10
 """
-# use the 25th cell in test data as an example
+# use the 51st cell in test data as an example
 # its label is cell type 7, lymphocyte, because we can use it as an example
 # to examine the performance on "lymphocyte differentiate to B cell (type 0) or Natural killer cell (type 4)"
-query_data = test_data[24]
-
+query_data = test_data[51]
+"""
+query_data = query_data.reshape(1, 980)
+z_query = model.forward(query_data[:, :-1].detach())
+z = np.zeros(11)
+for i in range(11):
+    z[i] = z_query[0, i]
+z_tensor = torch.tensor(z)
+log_probabilities_tensor = torch.nn.functional.log_softmax(z_tensor, dim=0)
+y = np.exp(log_probabilities_tensor.detach().numpy())
+"""
 
 # 1. You can search for trajetories towards type 0 and type 4 separately
 CFlabel = 0 # choose the counterfactual cell type of interest here
@@ -301,7 +313,8 @@ print(probability_CF_dic)
 
 CFlabel = 4 # choose the counterfactual cell type of interest here
 # set confidence factor alphas
-alphas = [0.01, 0.02, 0.04, 0.08,
+alphas = [1e-4,
+          0.01, 0.02, 0.04, 0.08,
           0.1, 0.2, 0.3,
           0.6, 0.8,
           1.2, 1.8,
@@ -316,15 +329,17 @@ print(f'use the alpha key to access the attributes of interest:\n'
 print(distance_obj_dic)
 print(probability_CF_dic)
 
-
+"""
 # 2. You can fine tune the two values in alpha to find the hybrid cell state where type 0 and type 4 are both considerable
 #    but it can't find the trajecotry with change of certain value in alpha to determine which state occurs first
 CFlabel = [0, 4] # choose the counterfactual cell type of interest here, which type 0 and type 4 in this case
 alpha = {0: 1,
-         4: 0.7} # fine tune here
+         4: 1.7,
+         'between': 0.8} # fine tune these three values
+alpha_bw = 0.8
 xCF, yCF, probability_CF, probability_F, distance_obj, dx, dx_position, dxpair, dxF, dxCF = solve_CF(formulation, query_data,
                                                                                               CFlabel, alpha)
-
+"""
 
 
 

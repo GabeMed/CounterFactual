@@ -12,10 +12,10 @@ from omlt.io.onnx import write_onnx_model_with_bounds, load_onnx_neural_network_
 from omlt.io.onnx import load_onnx_neural_network
 import onnx
 
-xpairs = np.load('xpairs.npy')
-test_data = np.load('test_data_new.npy')
+xpairs = np.load('data/xpairs.npy')
+test_data = np.load('data/test_data_new.npy')
 test_data = torch.from_numpy(test_data).float()
-train_data = np.load('train_data_new.npy')
+train_data = np.load('data/train_data_new.npy')
 train_data = torch.from_numpy(train_data).float()
 train_kwargs = {'batch_size': 256}
 test_kwargs = {'batch_size': 256}
@@ -36,7 +36,7 @@ class NeuralNetwork(nn.Module):
 
 # load weights from trained model
 model = NeuralNetwork()
-model.load_state_dict(torch.load('ANNmodel_weights_new.pth'))
+model.load_state_dict(torch.load('data/ANNmodel_weights_new.pth'))
 
 
 input_bounds = {}

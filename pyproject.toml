@@ -1,0 +1,10 @@
+[project]
+name = "counterfactual"
+version = "0.1.0"
+description = "Comparing the counterfactual explanation methods python vs julia"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "omlt>=1.2.2",
+    "torch>=2.8.0",
+]

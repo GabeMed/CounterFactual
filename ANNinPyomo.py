@@ -1,27 +1,17 @@
 import numpy as np
 import tempfile
-# pytorch for training neural network
 import torch, torch.onnx
 import torch.nn as nn
-# pyomo for optimization
 import pyomo.environ as pe
-# omlt for interfacing our neural network with pyomo
 from omlt import OmltBlock
-from omlt.neuralnet import FullSpaceNNFormulation
+from omlt.neuralnet import FullSpaceNNFormulation, ReluBigMFormulation
 from omlt.io.onnx import write_onnx_model_with_bounds, load_onnx_neural_network_with_bounds
-from omlt.io.onnx import load_onnx_neural_network
-import onnx
 
-xpairs = np.load('data/xpairs.npy')
-test_data = np.load('data/test_data_new.npy')
-test_data = torch.from_numpy(test_data).float()
-train_data = np.load('data/train_data_new.npy')
-train_data = torch.from_numpy(train_data).float()
-train_kwargs = {'batch_size': 256}
-test_kwargs = {'batch_size': 256}
+# Model dimensionalities
 input_size = 979
 hidden_size = 200
 output_size = 11
+
 class NeuralNetwork(nn.Module):
     def __init__(self):
         super(NeuralNetwork, self).__init__()
@@ -30,164 +20,194 @@ class NeuralNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, output_size)
         )
+
     def forward(self, x):
         logits = self.linear_relu_stack(x)
         return logits
 
-# load weights from trained model
-model = NeuralNetwork()
-model.load_state_dict(torch.load('data/ANNmodel_weights_new.pth'))
+
+def load_trained_model(weights_path: str) -> nn.Module:
+    model = NeuralNetwork()
+    state = torch.load(weights_path)
+    model.load_state_dict(state)
+    model.eval()
+    return model
 
 
-input_bounds = {}
-for i in range(979):
-    input_bounds[i] = (0.0, 1.0)
-
-# define dummy input tensor
-dummy_input = test_data[0, :-1].view(-1, 979)
+def make_input_bounds(num_inputs: int):
+    return {i: (0.0, 1.0) for i in range(num_inputs)}
 
 
-with tempfile.NamedTemporaryFile(suffix='.onnx', delete=False) as f:
-    # export neural network to ONNX
-    torch.onnx.export(
-        model,
-        dummy_input,
-        f,
-        input_names=['input'],
-        output_names=['output'],
-        dynamic_axes={
-            'input': {0: 'batch_size'},
-            'output': {0: 'batch_size'}
-        }
-    )
-    # write ONNX model and its bounds using OMLT
-    write_onnx_model_with_bounds(f.name, None, input_bounds)
-    # load the network definition from the ONNX model
-    network_definition = load_onnx_neural_network_with_bounds(f.name)
-    # IN THIS CASE, WE DON'T HAVE INPUT BOUNDS, SO NOT USE CODES ABOVE
-    #onnx_model = onnx.load(f.name)
-    #network_definition = load_onnx_neural_network(onnx_model)
+def make_dummy_input(sample_tensor: torch.Tensor, num_inputs: int):
+    """Create a 2D dummy input with shape (1, num_inputs) from a labeled row."""
+    return sample_tensor[0, :-1].view(-1, num_inputs)
 
-for layer_id, layer in enumerate(network_definition.layers):
-    print(f"{layer_id}\t{layer}\t{layer.activation}")
-formulation = FullSpaceNNFormulation(network_definition)
 
-# start our CF problem
-solver = pe.SolverFactory('gurobi')
-def build_basic_model(formulation):
-    m = pe.ConcreteModel()
-    # create an OMLT block for the neural network and build its formulation
-    m.nn = OmltBlock()
-    m.nn.build_formulation(formulation)
-    # Start Our CF formulation
-    # set all the x as binary variables since we only have 0-1 in all the dimensions in this case
-    for i in m.nn.inputs_set:
-        m.nn.inputs[i].domain = pe.Binary
-    # set the output class index, 0 ~ 10
-    m.IDX10 = pe.RangeSet(0, 10)
-    # set the query cell index, 0 ~ 978
-    m.IDX978 = pe.RangeSet(0, 978)
-    # create a blank (init all zeros) factual parameter
-    m.factual = pe.Param(m.IDX978, initialize={i: 0 for i in range(979)}, mutable=True)
-    # objective fn is to minimize the distance between factual and counterfactual
-    # in this case (all binary variables), we use manhattan distance
-    # we simply square them since it is equivalent to calculating the absolute value
-    m.obj = pe.Objective(expr=sum([(m.nn.inputs[i] - m.factual[i]) ** 2 for i in m.IDX978]),
-                         sense=pe.minimize)
+def export_and_load_network_definition(nn_model: nn.Module, nn_dummy_input: torch.Tensor, bounds):
+    with tempfile.NamedTemporaryFile(suffix='.onnx', delete=False) as f:
+        torch.onnx.export(
+            nn_model,
+            nn_dummy_input,
+            f,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
+        )
+        write_onnx_model_with_bounds(f.name, None, bounds)
+        return load_onnx_neural_network_with_bounds(f.name)
+
+
+def build_formulation(network_definition, use_milp=True):
+    """Build formulation - use MILP for ReLU with Gurobi, FullSpace for other cases."""
+    if use_milp:
+        return ReluBigMFormulation(network_definition)
+    else:
+        return FullSpaceNNFormulation(network_definition)
+
+def get_model_predicted_label(model, query_data):
+    """Get the model's predicted label for the factual data."""
+    with torch.no_grad():
+        z_query = model.forward(query_data[:-1].view(1, -1))
+        log_probabilities_tensor = torch.nn.functional.log_softmax(z_query, dim=1)
+        y = np.exp(log_probabilities_tensor.detach().numpy())
+        Flabel_pred = np.argmax(y[0])
+    return Flabel_pred, y[0]
+
+def build_counterfactual_model(formulation, use_explicit_flips=True):
+    model = pe.ConcreteModel()
+    model.nn = OmltBlock()
+    model.nn.build_formulation(formulation)
+    for i in model.nn.inputs_set:
+        model.nn.inputs[i].domain = pe.Binary
+    model.IDX10 = pe.RangeSet(0, output_size - 1)
+    model.IDX978 = pe.RangeSet(0, input_size - 1)
+    model.factual = pe.Param(model.IDX978, initialize={i: 0 for i in range(input_size)}, mutable=True)
+    
+    if use_explicit_flips:
+        # Add explicit binary flip variables for true L0 minimization
+        model.flip = pe.Var(model.IDX978, domain=pe.Binary)
+        model.flip_constraint1 = pe.Constraint(model.IDX978, rule=lambda m, i: m.flip[i] >= m.nn.inputs[i] - m.factual[i])
+        model.flip_constraint2 = pe.Constraint(model.IDX978, rule=lambda m, i: m.flip[i] >= m.factual[i] - m.nn.inputs[i])
+        model.obj = pe.Objective(expr=sum(model.flip[i] for i in model.IDX978), sense=pe.minimize)
+    else:
+        # Original squared difference objective (only L0 if features are exactly 0/1)
+        model.obj = pe.Objective(expr=sum([(model.nn.inputs[i] - model.factual[i]) ** 2 for i in model.IDX978]),
+                             sense=pe.minimize)
     print('basic model built')
-    return m
+    return model
 
-def generate_factual_param(m, query_data):
-    # create factual of interest as a parameter
+
+def generate_factual_param(model, query_data, torch_model):
     def generate_factual_dic(query_data):
         """
         Args:
             query_data: 1d tensor that represents the factual cell (include the label)
 
-        Returns: factual_dic, a dic {0: 0-1, 1: 0-1, ..., 978: 0-1} that encodes the factual cell's gene expression
-                 label, the true cell type
+        Returns: factual_dic, a dict {0: 0-1, 1: 0-1, ..., 978: 0-1} that encodes the factual cell's gene expression
+                 Flabel_pred, the model's predicted cell type
         """
         query_dataArr = query_data.numpy()
         x = query_dataArr[:-1]
-        Flabel = query_dataArr[-1]
-        print(f'the factual cell type is type {Flabel}, \n'
-              f'choose your counterfactual cell type in 0 ~ 10 except {Flabel}.')
+        Flabel_true = query_dataArr[-1]  # True label from dataset
+        
+        # Get model's predicted label
+        Flabel_pred, y_pred = get_model_predicted_label(torch_model, query_data)
+        
+        print(f'the factual cell type (dataset) is type {Flabel_true}, \n'
+              f'the factual cell type (model predicted) is type {Flabel_pred}, \n'
+              f'choose your counterfactual cell type in 0 ~ 10 except {Flabel_pred}.')
+        
         factual_dic = {}
         for i in range(x.size):
             factual_dic[i] = x[i]
-        return factual_dic, Flabel
-    factual_dic, Flabel = generate_factual_dic(query_data)
-    # set values for facutal parameter
+        return factual_dic, Flabel_pred
+    factual_dic, Flabel_pred = generate_factual_dic(query_data)
     for idx, value in factual_dic.items():
-        m.factual[idx].value = value
+        model.factual[idx].value = value
     xF = query_data[:-1].numpy() # factual parameter in array form
-    return xF, int(Flabel)
+    return xF, int(Flabel_pred)
 
-def search_nearest_CF(m, CFlabel, Flabel, alpha):
-    # add constraint that describes the ratio of probabilities of counterfactual and factual
-    # the ratio is controlled by a confidence factor, alpha
-    # >1 when 'forcing' counterfactual to be CFlabel cell type
-    # <1 when 'allowing' counterfactual to be the same as Flabel cell type
+
+def search_nearest_CF(model, CFlabel, Flabel, alpha, solver):
     if isinstance(CFlabel, int):
-        def CFandF_compete_rule(m):
-            return m.nn.outputs[CFlabel] >= m.nn.outputs[Flabel] + pe.log(alpha)
+        # Build concrete set of other classes (excluding CF and F)
+        others = [i for i in model.IDX10 if i not in {CFlabel, Flabel}]
+        model.OTHERS = pe.Set(initialize=others)
+        
+        def CFandF_compete_rule(model):
+            return model.nn.outputs[CFlabel] >= model.nn.outputs[Flabel] + pe.log(alpha)
 
-        m.CFandF_compete = pe.Constraint(rule=CFandF_compete_rule)
-        # add constraints such that the probabilities of counterfactual and factual must be greater than other cell types
-        #"""
-        def CF_dominant_rule(m, i):
-            return m.nn.outputs[CFlabel] >= m.nn.outputs[i]
-        m.CF_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=CF_dominant_rule)
+        model.CFandF_compete = pe.Constraint(rule=CFandF_compete_rule)
+        
+        def CF_dominant_rule(model, i):
+            return model.nn.outputs[CFlabel] >= model.nn.outputs[i]
+        model.CF_dominant = pe.Constraint(model.OTHERS, rule=CF_dominant_rule)
 
-        def F_dominant_rule(m, i):
-            return m.nn.outputs[Flabel] >= m.nn.outputs[i]
-        m.F_dominant = pe.Constraint(m.IDX10 - [CFlabel, Flabel], rule=F_dominant_rule)
-        #"""
+        # Remove F_dominant constraints - they fight the counterfactual change
     elif isinstance(CFlabel, list):
         if isinstance(alpha, list):
             raise ValueError("alpha must be dic as multiple CF labels are entered")
-        # considering multiple CF cells is of interest
-        m.alpha = pe.Param(CFlabel, initialize={key: value for key, value in alpha.items() if key != 'between'})
-        def CFandF_compete_rule(m, CFlabeli):
-            return m.nn.outputs[CFlabeli] >= m.nn.outputs[Flabel] + pe.log(m.alpha[CFlabeli])
-        m.CFandF_compete = pe.Constraint(pe.Set(initialize=CFlabel), rule=CFandF_compete_rule)
-        def CFandCF_compete_rule(m): # this constraint hasn't been developed to fit the situation where there are more than three CFlabel
-            return m.nn.outputs[CFlabel[0]] >= m.nn.outputs[CFlabel[1]] + pe.log(alpha['between'])
-        m.CFandCF_compete = pe.Constraint(rule=CFandCF_compete_rule)
-        def CF_dominant_rule(m, i, CFlabeli):
-            return m.nn.outputs[CFlabeli] >= m.nn.outputs[i]
-        m.CF_dominant = pe.Constraint(m.IDX10 - ([x for x in CFlabel] + [Flabel]), pe.Set(initialize=CFlabel), rule=CF_dominant_rule)
-        def F_dominant_rule(m, i):
-            return m.nn.outputs[Flabel] >= m.nn.outputs[i]
-        m.F_dominant = pe.Constraint(m.IDX10 - ([x for x in CFlabel] + [Flabel]), rule=F_dominant_rule)
+        model.alpha = pe.Param(CFlabel, initialize={key: value for key, value in alpha.items() if key != 'between'})
+        
+        # Build concrete set of other classes (excluding CF and F)
+        others = [i for i in model.IDX10 if i not in set(CFlabel + [Flabel])]
+        model.OTHERS = pe.Set(initialize=others)
+        
+        def CFandF_compete_rule(model, CFlabeli):
+            return model.nn.outputs[CFlabeli] >= model.nn.outputs[Flabel] + pe.log(model.alpha[CFlabeli])
+        model.CFandF_compete = pe.Constraint(pe.Set(initialize=CFlabel), rule=CFandF_compete_rule)
+        def CFandCF_compete_rule(model):
+            return model.nn.outputs[CFlabel[0]] >= model.nn.outputs[CFlabel[1]] + pe.log(alpha['between'])
+        model.CFandCF_compete = pe.Constraint(rule=CFandCF_compete_rule)
+        def CF_dominant_rule(model, i, CFlabeli):
+            return model.nn.outputs[CFlabeli] >= model.nn.outputs[i]
+        model.CF_dominant = pe.Constraint(model.OTHERS, pe.Set(initialize=CFlabel), rule=CF_dominant_rule)
+        
+        # Remove F_dominant constraints - they fight the counterfactual change
 
     else:
         raise ValueError("CFlabel must be integer or list")
 
-    solver.solve(m, tee=False)
-    # transform the xCF into numpy array
-    xCF = np.zeros(979)
-    for i in range(979):
-        xCF[i] = m.nn.inputs[i].value
-    # transform the outputs of final layer into numpy array, into probabilities yCF
-    zCF = np.zeros(11)
-    for i in range(11):
-        zCF[i] = m.nn.outputs[i].value
-    zCF_tensor = torch.tensor(zCF)
-    # in ANN training, we used CrossEntropyLoss() which contains logsoftmax instead of softmax
-    log_probabilities_tensor = torch.nn.functional.log_softmax(zCF_tensor, dim=0)
-    yCF = np.exp(log_probabilities_tensor.detach().numpy())
+    solver.solve(model, tee=False)
+    xCF = np.zeros(input_size)
+    for i in range(input_size):
+        xCF[i] = model.nn.inputs[i].value
+    zCF = np.zeros(output_size)
+    for i in range(output_size):
+        zCF[i] = model.nn.outputs[i].value
+    yCF = _to_probabilities(zCF)
     return xCF, yCF
 
-def solve_CF(formulation, query_data, CFlabel, alpha):
-    m = build_basic_model(formulation)
-    xF, Flabel = generate_factual_param(m, query_data)
-    xCF, yCF = search_nearest_CF(m, CFlabel, Flabel, alpha) # yCF is probabilities of each label
+
+def _to_probabilities(logits_array):
+    zCF_tensor = torch.tensor(logits_array)
+    log_probabilities_tensor = torch.nn.functional.log_softmax(zCF_tensor, dim=0)
+    return np.exp(log_probabilities_tensor.detach().numpy())
+
+
+def solve_CF(formulation, query_data, CFlabel, alpha, solver, xpairs, torch_model, use_explicit_flips=True):
+    model = build_counterfactual_model(formulation, use_explicit_flips=use_explicit_flips)
+    xF, Flabel = generate_factual_param(model, query_data, torch_model)
+    xCF, yCF = search_nearest_CF(model, CFlabel, Flabel, alpha, solver) # yCF is probabilities of each label
+    distance_obj = pe.value(model.obj)
+    result = _report_results(CFlabel, Flabel, yCF, xF, xCF, distance_obj, xpairs)
+    del model
+    return (xCF, yCF, result['probability_CF'], result['probability_F'],
+            distance_obj, result['dx_mask'], result['dx_positions'], result['dx_pairs'], result['dxF'], result['dxCF'])
+
+
+def _report_results(CFlabel, Flabel, yCF, xF, xCF, distance_obj, xpairs):
+    """Print outcome summary and return structured info for downstream use."""
     if isinstance(CFlabel, int):
         probability_CF = yCF[CFlabel]
         probability_F = yCF[Flabel]
-        label_CF = np.argmax(yCF)
+    else:
+        probability_CF = [yCF[CFlabeli] for CFlabeli in CFlabel]
+        probability_F = yCF[Flabel]
 
+    label_CF = int(np.argmax(yCF))
+
+    if isinstance(CFlabel, int):
         if label_CF == CFlabel:
             print(f'the most possible cell type is {label_CF}, as the same as input CFlabel: {CFlabel}\n'
                   f'the most possible cell type is {label_CF}, with probability of : {round(probability_CF * 100, 2)}% \n'
@@ -197,42 +217,46 @@ def solve_CF(formulation, query_data, CFlabel, alpha):
                   f'but the same as input Flabel: {Flabel}\n'
                   f'the most possible cell type is {label_CF}, with probability of : {round(probability_F * 100, 2)}% \n'
                   f'the second most possible cell type is {CFlabel}, with probability of : {round(probability_CF * 100, 2)}%')
-
-    elif isinstance(CFlabel, list):
-        probability_CF = [yCF[CFlabeli] for CFlabeli in CFlabel]
-        probability_F = yCF[Flabel]
-        label_CF = np.argmax(yCF)
-
+    else:
         if label_CF in CFlabel:
             print(f'the most possible cell type is {label_CF}, included in input CFlabel: {CFlabel}\n'
                   f'the most possible cell type is {label_CF}, with probability of : {round(max(probability_CF) * 100, 2)}% \n'
                   f'the other cell type in CFlabel is {[x for x in CFlabel if x != label_CF]}, '
                   f'with probability of : {[round(x * 100, 2) for x in probability_CF if x != max(probability_CF)]}% \n'
-                  f'the factual cell type is {Flabel}, with probability of: {round(probability_F * 100, 2)}% \n'
-                  )
+                  f'the factual cell type is {Flabel}, with probability of: {round(probability_F * 100, 2)}% \n')
         else:
             print(f'the most possible cell type is {label_CF}, not included in input CFlabel: {CFlabel}, \n'
                   f'but the same as input Flabel: {Flabel}\n'
                   f'the most possible cell type is {label_CF}, with probability of : {round(probability_F * 100, 2)}% \n'
-                  f'CF cell types are {CFlabel}, with probabilities of {[round(x * 100, 2) for x in probability_CF]}%'
-                  )
+                  f'CF cell types are {CFlabel}, with probabilities of {[round(x * 100, 2) for x in probability_CF]}%')
 
-    distance_obj = m.obj()
-    dx = xCF != xF
-    print(f'nearest distance is {sum(bool(d) for d in dx)}, as the same as obj value {distance_obj}')
-    dx_position = [i for i, d in enumerate(dx) if d]
-    print(f'the position of change is at {dx_position}')
-    dxpair = [xpairs[idx] for idx in dx_position]
-    dxF = [int(x) for x in [xF[idx] for idx in dx_position]]
-    dxCF = [int(x) for x in [xCF[idx] for idx in dx_position]]
-    print(f'dxpair: {dxpair} \n'
+    # Use np.isclose for robust difference counting to avoid float artifacts
+    dx_mask = ~np.isclose(xCF, xF, rtol=1e-10, atol=1e-10)
+    actual_flips = sum(dx_mask)
+    print(f'nearest distance is {actual_flips}, as the same as obj value {distance_obj}')
+    dx_positions = [i for i, d in enumerate(dx_mask) if d]
+    print(f'the position of change is at {dx_positions}')
+    dx_pairs = [xpairs[idx] for idx in dx_positions]
+    # Use proper rounding instead of int() casting for float values
+    dxF = [round(float(x)) for x in [xF[idx] for idx in dx_positions]]
+    dxCF = [round(float(x)) for x in [xCF[idx] for idx in dx_positions]]
+    print(f'dxpair: {dx_pairs} \n'
           f'dxF   : {dxF} \n'
           f'dCF   : {dxCF}')
-    # remember to delete the model for the next run
-    del m
-    return xCF, yCF, probability_CF, probability_F, distance_obj, dx, dx_position, dxpair, dxF, dxCF
 
-def solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas):
+    return {
+        'probability_CF': probability_CF,
+        'probability_F': probability_F,
+        'dx_mask': dx_mask,
+        'dx_positions': dx_positions,
+        'dx_pairs': dx_pairs,
+        'dxF': dxF,
+        'dxCF': dxCF,
+    }
+
+
+def solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas, solver, xpairs, torch_model, use_explicit_flips=True):
+    """Run a sweep over alphas and collect solutions where CF prob increases."""
     xCF_dic = {}
     yCF_dic = {}
     probability_CF_dic = {}
@@ -244,8 +268,7 @@ def solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas):
     dxCF_dic = {}
     last_probability_CF = 0
     for alpha in alphas:
-        xCF, yCF, probability_CF, probability_F, distance_obj, dx, dx_position, dxpair, dxF, dxCF = solve_CF(formulation, query_data,
-                                                                                              CFlabel, alpha)
+        xCF, yCF, probability_CF, probability_F, distance_obj, dx, dx_position, dxpair, dxF, dxCF = solve_CF(formulation, query_data, CFlabel, alpha, solver, xpairs, torch_model, use_explicit_flips)
         if probability_CF - last_probability_CF > 0.01:
             xCF_dic[alpha] = xCF
             yCF_dic[alpha] = yCF
@@ -258,6 +281,27 @@ def solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas):
             dxCF_dic[alpha] = dxCF
             last_probability_CF = probability_CF
     return xCF_dic, yCF_dic, probability_CF_dic, probability_F_dic, distance_obj_dic, dx_position_dic, dxpair_dic, dxF_dic, dxCF_dic
+
+
+def run_alpha_sweep(formulation, query_data, CFlabel, alphas, solver, xpairs, torch_model, use_explicit_flips=True):
+    xCF_dic, yCF_dic, probability_CF_dic, probability_F_dic, distance_obj_dic, dx_position_dic, dxpair_dic, dxF_dic, dxCF_dic = solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas, solver, xpairs, torch_model, use_explicit_flips)
+    alpha_key = list(xCF_dic.keys())
+    print(f'use the alpha key to access the attributes of interest:\n{alpha_key}')
+    print(distance_obj_dic)
+    print(probability_CF_dic)
+    return {
+        'xCF': xCF_dic,
+        'yCF': yCF_dic,
+        'pCF': probability_CF_dic,
+        'pF': probability_F_dic,
+        'dist': distance_obj_dic,
+        'dx_pos': dx_position_dic,
+        'dx_pairs': dxpair_dic,
+        'dxF': dxF_dic,
+        'dxCF': dxCF_dic,
+    }
+
+
 def get_cell_types():
     print("0: B cell \n"
           "1: epithelial cell \n"
@@ -270,76 +314,6 @@ def get_cell_types():
           "8: macrophage \n"
           "9: granulocyte \n"
           "10: rand \n")
-
-"""
-you can choose your factual and counterfactual here
-query_data = test_data[i] # the ith data point in test data
-make sure check the factual label by:
-print(query_data[-1])
-CFlabel = i # i from 0 to 10
-"""
-# use the 51st cell in test data as an example
-# its label is cell type 7, lymphocyte, because we can use it as an example
-# to examine the performance on "lymphocyte differentiate to B cell (type 0) or Natural killer cell (type 4)"
-query_data = test_data[51]
-"""
-query_data = query_data.reshape(1, 980)
-z_query = model.forward(query_data[:, :-1].detach())
-z = np.zeros(11)
-for i in range(11):
-    z[i] = z_query[0, i]
-z_tensor = torch.tensor(z)
-log_probabilities_tensor = torch.nn.functional.log_softmax(z_tensor, dim=0)
-y = np.exp(log_probabilities_tensor.detach().numpy())
-"""
-
-# 1. You can search for trajetories towards type 0 and type 4 separately
-CFlabel = 0 # choose the counterfactual cell type of interest here
-# set confidence factor alphas
-alphas = [0.01, 0.02, 0.04, 0.08,
-          0.1, 0.2, 0.3,
-          0.6, 0.8,
-          1.2, 1.8,
-          3, 5, 8, 10,
-          15, 20, 30, 40, 50, 60,
-          100, 200, 300, 400
-          ]
-xCF_dic, yCF_dic, probability_CF_dic, probability_F_dic, distance_obj_dic, dx_position_dic, dxpair_dic, dxF_dic, dxCF_dic = solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas)
-alpha_key = list(xCF_dic.keys())
-print(f'use the alpha key to access the attributes of interest:\n'
-      f'{alpha_key}')
-print(distance_obj_dic)
-print(probability_CF_dic)
-
-CFlabel = 4 # choose the counterfactual cell type of interest here
-# set confidence factor alphas
-alphas = [1e-4,
-          0.01, 0.02, 0.04, 0.08,
-          0.1, 0.2, 0.3,
-          0.6, 0.8,
-          1.2, 1.8,
-          3, 5, 8, 10,
-          15, 20, 30, 40, 50, 60,
-          100, 200, 300, 400
-          ]
-xCF_dic, yCF_dic, probability_CF_dic, probability_F_dic, distance_obj_dic, dx_position_dic, dxpair_dic, dxF_dic, dxCF_dic = solve_CF_with_diff_alpha(formulation, query_data, CFlabel, alphas)
-alpha_key = list(xCF_dic.keys())
-print(f'use the alpha key to access the attributes of interest:\n'
-      f'{alpha_key}')
-print(distance_obj_dic)
-print(probability_CF_dic)
-
-"""
-# 2. You can fine tune the two values in alpha to find the hybrid cell state where type 0 and type 4 are both considerable
-#    but it can't find the trajecotry with change of certain value in alpha to determine which state occurs first
-CFlabel = [0, 4] # choose the counterfactual cell type of interest here, which type 0 and type 4 in this case
-alpha = {0: 1,
-         4: 1.7,
-         'between': 0.8} # fine tune these three values
-alpha_bw = 0.8
-xCF, yCF, probability_CF, probability_F, distance_obj, dx, dx_position, dxpair, dxF, dxCF = solve_CF(formulation, query_data,
-                                                                                              CFlabel, alpha)
-"""
 
 
 

@@ -106,14 +106,6 @@ Builds the JuMP optimization model for counterfactual generation.
 function build_counterfactual_model(use_explicit_flips::Bool=true)
     model = Model(Gurobi.Optimizer)
     
-    # Use Gurobi default settings to match Python behavior
-    # (Commented out custom settings that differ from Python defaults)
-    # set_optimizer_attribute(model, "TimeLimit", 30.0)  # 30 second timeout
-    # set_optimizer_attribute(model, "MIPGap", 0.1)      # 10% gap tolerance
-    # set_optimizer_attribute(model, "MIPFocus", 1)      # Focus on feasible solutions
-    # set_optimizer_attribute(model, "Heuristics", 0.1)  # Reduce heuristics time
-    # set_optimizer_attribute(model, "Cuts", 0)          # Disable cuts for speed
-    
     # Input variables (binary)
     @variable(model, x[i=1:INPUT_SIZE], Bin)
     

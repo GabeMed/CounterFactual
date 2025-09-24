@@ -7,6 +7,7 @@ using Random
 using Printf
 using Statistics
 using PyCall
+using MathOptAI
 
 # Include the weight conversion function
 include("convert_weights.jl")
@@ -45,7 +46,7 @@ end
 """
     load_trained_model(weights_path::String)
 
-Loads a trained PyTorch model weights file converted to BSON format.
+Loads a trained PyTorch model weights file converted to BSON format and creates a Flux Chain.
 """
 function load_trained_model(weights_path::String)
     # Convert .pth to .bson if needed
@@ -63,14 +64,17 @@ function load_trained_model(weights_path::String)
     # Load the converted weights
     weights = BSON.load(bson_path)
     
-    # Create model structure
-    model = NeuralNetwork()
+    # Create Flux Chain model (MathOptAI works best with Flux.Chain)
+    model = Chain(
+        Dense(INPUT_SIZE, HIDDEN_SIZE, relu),
+        Dense(HIDDEN_SIZE, OUTPUT_SIZE)
+    )
     
     # Load weights into model (transpose to match Flux convention)
-    model.linear1.weight .= Float32.(transpose(weights["linear1.weight"]))
-    model.linear1.bias .= Float32.(weights["linear1.bias"])
-    model.linear2.weight .= Float32.(transpose(weights["linear2.weight"]))
-    model.linear2.bias .= Float32.(weights["linear2.bias"])
+    model[1].weight .= Float32.(transpose(weights["linear1.weight"]))
+    model[1].bias .= Float32.(weights["linear1.bias"])
+    model[2].weight .= Float32.(transpose(weights["linear2.weight"]))
+    model[2].bias .= Float32.(weights["linear2.bias"])
     
     println("Loaded actual PyTorch weights from $bson_path")
     return model
@@ -86,11 +90,11 @@ function make_input_bounds(num_inputs::Int)
 end
 
 """
-    get_model_predicted_label(model::NeuralNetwork, query_data::Vector{Float64})
+    get_model_predicted_label(model::Chain, query_data::Vector{Float64})
 
 Gets the model's predicted label for the factual data.
 """
-function get_model_predicted_label(model::NeuralNetwork, query_data::Vector{Float64})
+function get_model_predicted_label(model::Chain, query_data::Vector{Float64})
     x = query_data[1:end-1]  # Remove label
     logits = model(x)
     probabilities = softmax(logits)
@@ -99,25 +103,25 @@ function get_model_predicted_label(model::NeuralNetwork, query_data::Vector{Floa
 end
 
 """
-    build_counterfactual_model(use_explicit_flips::Bool=true)
+    build_counterfactual_model(neural_network::Chain, use_explicit_flips::Bool=true)
 
-Builds the JuMP optimization model for counterfactual generation.
+Builds the JuMP optimization model for counterfactual generation using MathOptAI.jl.
 """
-function build_counterfactual_model(use_explicit_flips::Bool=true)
+function build_counterfactual_model(neural_network::Chain, use_explicit_flips::Bool=true)
     model = Model(Gurobi.Optimizer)
+    set_silent(model)  # Suppress Gurobi output for cleaner logs
     
-    # Input variables (binary)
-    @variable(model, x[i=1:INPUT_SIZE], Bin)
-    
-    # Hidden layer variables
-    @variable(model, z1[i=1:HIDDEN_SIZE])
-    @variable(model, a1[i=1:HIDDEN_SIZE] >= 0)  # ReLU activations
-    
-    # Output layer variables
-    @variable(model, z2[i=1:OUTPUT_SIZE])
+    # Input variables (binary with bounds for MathOptAI)
+    @variable(model, 0 <= x[i=1:INPUT_SIZE] <= 1, Bin)
     
     # Factual input parameter (as variables that will be fixed)
     @variable(model, x_factual[i=1:INPUT_SIZE])
+    
+    # Convert Flux.Chain to MathOptAI.Pipeline with explicit ReLUBigM
+    # This is necessary because Flux.Chain ignores config and uses nonlinear ReLU
+    pipeline = convert_flux_to_mathoptai_pipeline(neural_network)
+    
+    y, formulation = MathOptAI.add_predictor(model, pipeline, x)
     
     # Objective: minimize L0 distance (number of flips)
     if use_explicit_flips
@@ -129,71 +133,51 @@ function build_counterfactual_model(use_explicit_flips::Bool=true)
         @objective(model, Min, sum(x[i]^2 for i in 1:INPUT_SIZE))  # Placeholder
     end
     
-    # Store the use_explicit_flips flag in the model
+    # Store the use_explicit_flips flag and formulation in the model
     model.ext[:use_explicit_flips] = use_explicit_flips
+    model.ext[:nn_formulation] = formulation
     
-    println("Basic model built")
-    return model, x, z1, a1, z2, x_factual
+    println("Model built with MathOptAI Pipeline (ReLUBigM)")
+    return model, x, y, x_factual
 end
 
 """
-    add_neural_network_constraints!(model, x, z1, a1, z2, model_weights)
+    convert_flux_to_mathoptai_pipeline(neural_network::Chain)
 
-Adds neural network constraints to the JuMP model.
+Converts a Flux.Chain to MathOptAI.Pipeline with explicit ReLUBigM formulation.
 """
-function add_neural_network_constraints!(model, x, z1, a1, z2, model_weights)
-    # Use the actual model weights
-    W1 = model_weights.linear1.weight
-    b1 = model_weights.linear1.bias
-    W2 = model_weights.linear2.weight
-    b2 = model_weights.linear2.bias
+function convert_flux_to_mathoptai_pipeline(neural_network::Chain)
+    layers = []
     
-    # Hidden layer constraints: z1 = W1 * x + b1
-    @constraint(model, hidden_layer[i=1:HIDDEN_SIZE], 
-                z1[i] == sum(W1[i,j] * x[j] for j in 1:INPUT_SIZE) + b1[i])
-    
-    # Proper Big-M ReLU formulation
-    # Calculate reasonable bounds based on weight magnitudes and input bounds
-    # For binary inputs [0,1], max pre-activation = sum(|W[i,:]|) + |b[i]|
-    M_values = Float64[]
-    for i in 1:HIDDEN_SIZE
-        # Calculate maximum absolute pre-activation value for neuron i
-        weight_sum = sum(abs.(W1[i, :]))  # Sum of absolute weights
-        bias_abs = abs(b1[i])             # Absolute bias
-        max_preactivation = weight_sum + bias_abs
-        push!(M_values, max_preactivation)
+    for (i, layer) in enumerate(neural_network)
+        if isa(layer, Dense)
+            # Extract weights and bias
+            W = Float64.(layer.weight)  # Convert to Float64
+            b = Float64.(layer.bias)
+            
+            # Add Affine layer
+            push!(layers, MathOptAI.Affine(W, b))
+            
+            # Check if this layer has relu activation
+            if layer.σ == relu
+                # Add ReLU with Big-M formulation
+                push!(layers, MathOptAI.ReLUBigM(1000.0))
+            end
+        end
     end
     
-    # Use overall maximum for all neurons (conservative but simple)
-    M_bound = maximum(M_values) * 1.1  # Add 10% buffer
-    M_pos = M_bound  # Upper bound for positive activations  
-    M_neg = M_bound  # Upper bound for absolute value of negative pre-activations
-    
-    println("Calculated Big-M bounds: M_pos=$M_pos, M_neg=$M_neg")
-    
-    @variable(model, y[i=1:HIDDEN_SIZE], Bin)
-    
-    # ReLU constraints: a1[i] = max(0, z1[i])
-    # When y[i] = 1: z1[i] >= 0, a1[i] = z1[i] 
-    # When y[i] = 0: z1[i] <= 0, a1[i] = 0
-    @constraint(model, relu_pos[i=1:HIDDEN_SIZE], a1[i] >= z1[i])
-    @constraint(model, relu_upper[i=1:HIDDEN_SIZE], a1[i] <= M_pos * y[i])
-    @constraint(model, relu_lower[i=1:HIDDEN_SIZE], z1[i] <= M_neg * y[i])
-    @constraint(model, relu_neg[i=1:HIDDEN_SIZE], z1[i] >= -M_neg * (1 - y[i]))
-    # CRITICAL: Ensure a1[i] <= z1[i] when y[i] = 1 (forces a1[i] = z1[i])
-    @constraint(model, relu_equal[i=1:HIDDEN_SIZE], a1[i] <= z1[i] + M_pos * (1 - y[i]))
-    
-    # Output layer constraints: z2 = W2 * a1 + b2
-    @constraint(model, output_layer[i=1:OUTPUT_SIZE], 
-                z2[i] == sum(W2[i,j] * a1[j] for j in 1:HIDDEN_SIZE) + b2[i])
+    return MathOptAI.Pipeline(layers)
 end
 
+# Neural network constraints are now handled automatically by MathOptAI.jl
+# with ReLUBigM formulation for Gurobi compatibility
+
 """
-    generate_factual_param!(model, query_data::Vector{Float64}, torch_model::NeuralNetwork)
+    generate_factual_param!(model, query_data::Vector{Float64}, torch_model::Chain)
 
 Sets the factual parameters in the model and returns factual data and predicted label.
 """
-function generate_factual_param!(model, query_data::Vector{Float64}, torch_model::NeuralNetwork)
+function generate_factual_param!(model, query_data::Vector{Float64}, torch_model::Chain)
     x_factual = query_data[1:end-1]  # Remove label
     factual_label_true = Int(round(query_data[end]))  # Round to nearest integer
     
@@ -223,12 +207,13 @@ function generate_factual_param!(model, query_data::Vector{Float64}, torch_model
 end
 
 """
-    search_nearest_CF(model, CFlabel, Flabel, alpha, solver)
+    search_nearest_CF(model, CFlabel, Flabel, alpha, solver, y)
 
 Solves for the nearest counterfactual with given constraints.
 """
-function search_nearest_CF(model, CFlabel, Flabel, alpha, solver)
-    z2 = model[:z2]
+function search_nearest_CF(model, CFlabel, Flabel, alpha, solver, y)
+    # y contains the output layer variables from MathOptAI
+    z2 = y  # MathOptAI returns the output variables directly
     
     if isa(CFlabel, Int)
         # Single counterfactual label (convert to 1-based indexing)
@@ -296,22 +281,19 @@ function to_probabilities(logits::Vector{Float64})
 end
 
 """
-    solve_CF(torch_model::NeuralNetwork, query_data::Vector{Float64}, CFlabel, alpha, xpairs, use_explicit_flips::Bool=true)
+    solve_CF(torch_model::Chain, query_data::Vector{Float64}, CFlabel, alpha, xpairs, use_explicit_flips::Bool=true)
 
-Main function to solve counterfactual generation.
+Main function to solve counterfactual generation using MathOptAI.jl.
 """
-function solve_CF(torch_model::NeuralNetwork, query_data::Vector{Float64}, CFlabel, alpha, xpairs, use_explicit_flips::Bool=true)
-    # Build model
-    model, x, z1, a1, z2, x_factual = build_counterfactual_model(use_explicit_flips)
+function solve_CF(torch_model::Chain, query_data::Vector{Float64}, CFlabel, alpha, xpairs, use_explicit_flips::Bool=true)
+    # Build model with MathOptAI neural network integration
+    model, x, y, x_factual = build_counterfactual_model(torch_model, use_explicit_flips)
     
-    # Add neural network constraints
-    add_neural_network_constraints!(model, x, z1, a1, z2, torch_model)
-    
-    # Set factual parameters
+    # Set factual parameters (neural network constraints are handled automatically by MathOptAI)
     xF, Flabel = generate_factual_param!(model, query_data, torch_model)
     
     # Solve for counterfactual
-    xCF, yCF = search_nearest_CF(model, CFlabel, Flabel, alpha, model)
+    xCF, yCF = search_nearest_CF(model, CFlabel, Flabel, alpha, model, y)
     
     # Calculate distance
     distance_obj = objective_value(model)
